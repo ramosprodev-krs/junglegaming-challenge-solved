@@ -1,0 +1,19 @@
+$kind: http-request
+url: http://localhost:3000/wallets
+method: POST
+body:
+  type: json
+  content: "{\r
+
+    \  \"playerId\": \"player-1\",\r
+
+    \  \"initialBalance\": {\r
+
+    \    \"amount\": \"100.00\",\r
+
+    \    \"currency\": \"BRL\"\r
+
+    \  }\r
+
+    }"
+order: 2000

@@ -1,0 +1,4 @@
+$kind: http-request
+url: http://localhost:3000/wallets/53a5414f-9094-43d8-b546-722304f3f2d3/ledger
+method: GET
+order: 5000

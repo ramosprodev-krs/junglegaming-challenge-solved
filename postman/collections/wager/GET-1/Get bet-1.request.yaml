@@ -1,0 +1,5 @@
+$kind: http-request
+name: Get bet
+url: http://localhost:3000/providers/provider-a/wagering/transactions/bet-001
+method: GET
+order: 1000

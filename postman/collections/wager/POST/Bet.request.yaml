@@ -1,0 +1,35 @@
+$kind: http-request
+url: http://localhost:3000/wagering/transactions
+method: POST
+headers:
+  Idempotency-Key: provider-a:win-00
+body:
+  type: json
+  content: "\r
+
+    {\r
+
+    \  \"providerId\": \"provider-a\",\r
+
+    \  \"externalTransactionId\": \"win-001\",\r
+
+    \  \"playerId\": \"player-1\",\r
+
+    \  \"walletId\": \"53a5414f-9094-43d8-b546-722304f3f2d3\",\r
+
+    \  \"roundId\": \"round-1\",\r
+
+    \  \"gameId\": \"game-1\",\r
+
+    \  \"kind\": \"WIN\",\r
+
+    \  \"money\": {\r
+
+    \    \"amount\": \"10.00\",\r
+
+    \    \"currency\": \"BRL\"\r
+
+    \  }\r
+
+    }"
+order: 1000

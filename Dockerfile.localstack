@@ -1,0 +1,3 @@
+FROM localstack/localstack:4.8.1
+COPY localstack/init-sqs.sh /etc/localstack/init/ready.d/init-sqs.sh
+RUN chmod 755 /etc/localstack/init/ready.d/init-sqs.sh
