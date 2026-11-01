@@ -1,102 +1,66 @@
-# Architecture
+# Arquitetura
 
-## Overview
+## Visão geral
 
-Wager Processor receives wallet operations over HTTP or SQS and applies them
-to PostgreSQL. Both entry points call `WagerProcessorService`, so financial
-rules are shared. The project uses a pragmatic DDD structure: domain rules are
-modeled separately, while the application service coordinates MikroORM
-transactions and parameterized SQL directly.
+O serviço recebe operações financeiras por HTTP ou SQS e atualiza carteiras
+no PostgreSQL. As duas entradas usam `WagerProcessorService`, compartilhando
+as mesmas regras. O projeto separa domínio, aplicação, interface HTTP,
+infraestrutura e migrations, sem adotar uma arquitetura em camadas rígidas:
+o serviço de aplicação também coordena SQL parametrizado e transações.
 
-| Area | Responsibility |
-|---|---|
-| `src/domain` | Money, wallet, wager, ledger, inbox/outbox and event rules |
-| `src/application` | Use cases, database transactions, queries and reconciliation |
-| `src/http` | Controllers, guard and HTTP error mapping |
-| `src/infrastructure` | PostgreSQL mappings, SQS client and workers |
-| `src/migrations` | Versioned database schema |
+## Decisões principais
 
-## Key decisions
+- **Precisão monetária:** contratos recebem valores como strings, o domínio
+  usa `Decimal` e o PostgreSQL usa `numeric(20,2)`. Isso evita erros de ponto
+  flutuante. A moeda é validada pelo formato de três letras, não por uma lista
+  completa de códigos ISO.
+- **Concorrência:** `SELECT ... FOR UPDATE` bloqueia a carteira alterada.
+  Operações na mesma carteira são serializadas; carteiras diferentes podem
+  avançar em paralelo. Constraints do banco também protegem saldo, unicidade
+  e integridade do ledger.
+- **Idempotência:** a `Idempotency-Key` e o hash do conteúdo são persistidos.
+  Repetir chave e conteúdo retorna o resultado existente; reutilizar a chave
+  com dados diferentes gera conflito. A identidade externa do provedor também
+  é única.
+- **Saldo e ledger:** saldo materializado e lançamento imutável são gravados
+  na mesma transação. A reconciliação detecta divergências, mas não corrige o
+  saldo automaticamente.
+- **Inbox e outbox:** a inbox deduplica mensagens SQS; a outbox grava eventos
+  junto da operação financeira e os publica após o commit. A entrega é
+  *at-least-once*: uma falha depois do envio pode gerar duplicata, então
+  consumidores devem deduplicar por `eventId`.
+- **Referências fora de ordem:** operações sem referência ficam em
+  `PENDING_REFERENCE` e são tentadas novamente com backoff. Após dez tentativas,
+  são rejeitadas com `REFERENCE_NOT_FOUND`.
+- **MikroORM e SQL:** MikroORM integra conexões e transações ao NestJS. SQL
+  parametrizado deixa locks, `ON CONFLICT` e `SKIP LOCKED` explícitos, mas
+  mantém parte do mapeamento e da persistência sob responsabilidade do serviço.
 
-### Money
+O publisher da outbox mantém uma transação do banco durante a chamada ao SQS.
+Isso simplifica a disputa entre publishers, mas pode prolongar locks se a fila
+estiver lenta. Uma estratégia futura de reserva com lease poderia reduzir esse
+tempo, desde que também trate leases expirados e duplicatas.
 
-Amounts are decimal strings in API contracts, `Decimal` in the domain and
-`numeric(20,2)` in PostgreSQL. This avoids binary floating-point errors.
-Currency codes are checked for a three-uppercase-letter format; the code does
-not validate them against a complete ISO currency list.
+## Autenticação
 
-### Concurrency and database integrity
+A autenticação foi deixada de fora conforme permitido pelo desafio.
+`ProviderAuthGuard` é um ponto de extensão no-op e atualmente permite as
+requisições sem validar a identidade do provedor. Antes de expor o serviço,
+é necessário integrar um provedor OIDC/JWT e autorizar a identidade para o
+`providerId` informado.
 
-The service locks the target wallet row with `SELECT ... FOR UPDATE`. Requests
-for one wallet are serialized, while different wallets can be processed
-concurrently. PostgreSQL constraints provide a second line of defense for
-non-negative balances, uniqueness and ledger integrity. Lock conflicts are
-retried a limited number of times before returning an error.
+## Testes e limites conhecidos
 
-### Idempotency
+Os testes de integração com PostgreSQL e LocalStack cobrem constraints,
+entregas duplicadas, apostas concorrentes, carteiras distintas, redelivery SQS
+e referência que chega depois. O teste de concorrência usa conexões ORM
+separadas no mesmo processo; não comprova o comportamento de vários processos
+do sistema operacional.
 
-`Idempotency-Key` is stored in PostgreSQL with a SHA-256 hash of the business
-payload. Repeating the same key and payload returns the existing result;
-reusing the key with different business data is a conflict. The database also
-enforces uniqueness of `(provider_id, external_transaction_id)`. SQS FIFO
-deduplication is not the source of financial correctness.
+Ainda não há testes explícitos de crash/reinício entre commit e confirmação da
+mensagem, encaminhamento real à DLQ, publishers independentes concorrendo pela
+outbox ou várias instâncias em processos separados. Não apresentar esses
+cenários como garantias já comprovadas.
 
-### Wallet and ledger
-
-The wallet balance is materialized for fast reads. Each balance change and its
-immutable ledger entry are committed in the same PostgreSQL transaction.
-`LOSS` records an operation without changing balance. Reconciliation compares
-the stored balance with the net ledger total and reports differences; it does
-not repair them automatically.
-
-### Inbox, outbox and SQS
-
-The SQS consumer records its inbox entry with the operation and acknowledges
-the message after the database work completes. Financial events are stored in
-the outbox in the same transaction as the wallet change, then published to
-SQS. Delivery is at-least-once: a crash after SQS accepts an event but before
-the database records publication can produce a duplicate. Downstream
-consumers should deduplicate by `eventId`.
-
-The current outbox publisher holds a database transaction while sending to
-SQS. This keeps the claim logic straightforward with `FOR UPDATE SKIP LOCKED`,
-but a slow broker can hold database connections and locks longer. A future
-claim/lease design could shorten that transaction, but would need its own
-recovery and duplicate-publication tests.
-
-### References and retries
-
-Operations that arrive before their referenced transaction remain
-`PENDING_REFERENCE` and are retried with exponential backoff. After ten
-attempts, the operation is rejected with `REFERENCE_NOT_FOUND`.
-
-### ORM and SQL
-
-MikroORM provides NestJS integration, connections and transaction management.
-Critical paths use parameterized SQL to make locking, `ON CONFLICT` and
-`SKIP LOCKED` behavior explicit. The trade-off is that query mapping and
-database details remain the application's responsibility.
-
-## Authentication
-
-Authentication is intentionally not implemented, as allowed by the challenge.
-`ProviderAuthGuard` is a no-op extension point: it currently permits requests
-and does not verify provider identity. Before production exposure, integrate
-an external OIDC/JWT identity provider and authorize the authenticated
-identity against `providerId`. Health endpoints remain public as required.
-
-## Validation and known gaps
-
-Integration tests use PostgreSQL and LocalStack. They cover database
-constraints, duplicate deliveries, concurrent bets, separate wallet
-connections, SQS redelivery and a reference arriving late. The concurrency
-test creates separate ORM instances in one OS process; it does not prove
-multi-process behavior.
-
-The current suite does not explicitly test crash/restart between commit and
-SQS acknowledgement, effective DLQ redrive, independent concurrent outbox
-publishers or three separate application processes. These should not be
-claimed as verified guarantees.
-
-Run instructions and Postman examples are in `README.md`. Local and AWS
-infrastructure configuration is in `INFRASTRUCTURE.md`.
+Para executar e testar, consulte `README.md`. A configuração de infraestrutura
+local e AWS está em `INFRAESTRUTURA.md`.
