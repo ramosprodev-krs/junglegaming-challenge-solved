@@ -6,7 +6,7 @@ Serviço de processamento de operações financeiras de apostas, desenvolvido co
 
 O projeto implementa o fluxo funcional do desafio: carteiras, operações de aposta, ledger, idempotência, concorrência por carteira, reconciliação, integração SQS com inbox/outbox, migrations, métricas e testes. É possível executá-lo localmente e exercitar os fluxos descritos neste README.
 
-**Ainda não está pronto para exposição em produção.** O `ProviderAuthGuard` é intencionalmente no-op: a API não autentica nem autoriza provedores. Antes de produção, implemente OIDC/JWT e autorização por provedor, configure filas/permissões AWS e segredos reais, e execute as migrations como etapa de release. Veja [`ARCHITECTURE.md`](ARCHITECTURE.md) e [`infraestructure.md`](infraestructure.md) para detalhes e limitações.
+**Ainda não está pronto para exposição em produção.** O `ProviderAuthGuard` é intencionalmente no-op: a API não autentica nem autoriza provedores. Antes de produção, implemente OIDC/JWT e autorização por provedor, configure filas/permissões AWS e segredos reais, e execute as migrations como etapa de release. Veja [`ARCHITECTURE.md`](ARCHITECTURE.md) e [`INFRASTRUCTURE.md`](INFRASTRUCTURE.md) para detalhes e limitações.
 
 **Escopo de validação:** os testes atuais cobrem invariantes de domínio, constraints reais do PostgreSQL, concorrência entre conexões/instâncias da aplicação, mensagens repetidas e referências fora de ordem. Eles ainda não demonstram todos os cenários pedidos pela rubrica, como múltiplos processos independentes, recuperação após crash/restart, concorrência de publishers Outbox e encaminhamento à DLQ.
 
