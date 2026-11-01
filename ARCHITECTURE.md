@@ -1,149 +1,103 @@
 # Arquitetura do Wager Processor
 
-## 1. Objetivo
+## Objetivo e escopo
 
-O serviço recebe operações de apostas e prêmios de provedores de jogos, aplica essas operações às carteiras dos jogadores e mantém um histórico financeiro auditável. Ele oferece duas entradas para as operações: HTTP síncrono e mensagens assíncronas por SQS. As duas entradas chamam o mesmo caso de uso de aplicação, para que uma aposta tenha as mesmas regras independentemente de como chegou.
+O serviço recebe operações financeiras de provedores de jogos, aplica seus efeitos às carteiras e mantém um histórico auditável. Há duas entradas: API HTTP e mensagens SQS. Ambas chamam o mesmo caso de uso (`WagerProcessorService`) e persistem em PostgreSQL.
 
-O foco arquitetural é proteger invariantes financeiras diante de repetição de mensagens, concorrência, falhas de processo e referências que chegam fora de ordem. Para isso, as regras principais ficam no domínio e o PostgreSQL é a autoridade final de integridade e concorrência.
+O desenho prioriza precisão monetária, idempotência persistente, concorrência por carteira, ledger e recuperação de mensagens. A autenticação foi deixada de fora conforme permitido pelo desafio. O `ProviderAuthGuard` é um ponto de extensão no-op; esta aplicação não deve ser exposta a tráfego não confiável antes de integrar um IdP OIDC/JWT e autorização por provedor.
 
-## 2. Organização do código
+## Estrutura e responsabilidades
 
-O projeto usa NestJS para composição e entrada HTTP, mas organiza as regras em camadas inspiradas em DDD:
+| Área | Responsabilidade |
+|---|---|
+| `src/domain` | Regras independentes de HTTP, banco e NestJS: `Money`, `Wallet`, transações, ledger, inbox/outbox e eventos |
+| `src/application` | Casos de uso, transações PostgreSQL, validação, consultas, reconciliação e métricas |
+| `src/http` | Controllers, guard e tradução de erros para HTTP |
+| `src/infrastructure` | MikroORM, schema de persistência, AWS SDK SQS e workers |
+| `src/migrations` | Schema versionado e reversível |
 
-| Diretório | Responsabilidade | Analogia com Spring |
+O NestJS faz a composição por módulos, controllers, providers e injeção de dependência. O desenho é DDD pragmático: regras centrais estão em objetos do domínio, mas `WagerProcessorService` também coordena SQL parametrizado diretamente. Não há repositório formal para cada agregado. Isso reduz indirection e deixa locks e constraints visíveis, ao custo de um application service mais acoplado à persistência.
+
+## Decisões técnicas e justificativas
+
+| Decisão | Motivo e garantia | Custo ou limite |
 |---|---|---|
-| `src/domain` | Conceitos e regras de negócio independentes de HTTP, NestJS e banco | Classes de domínio Java, value objects e entidades de negócio |
-| `src/application` | Orquestra casos de uso e transações | `@Service`/application services |
-| `src/http` | Controllers, guard, health checks e tradução de erros HTTP | `@RestController`, filtros e interceptors |
-| `src/infrastructure` | PostgreSQL/MikroORM, SQS e workers | Adaptadores de banco e mensageria |
-| `src/migrations` | Evolução versionada do schema | Flyway/Liquibase |
+| `Decimal` no domínio, string nos contratos e `numeric(20,2)` no PostgreSQL | Evita erros de ponto flutuante em operações financeiras. O formato de entrada aceita string decimal não negativa com até duas casas; a moeda é validada como código de três letras maiúsculas. | A validação verifica o formato da moeda, não consulta uma lista completa de códigos ISO. |
+| Lock pessimista por linha da carteira (`SELECT ... FOR UPDATE`) | Serializa alterações concorrentes na mesma carteira sem usar lock global. O banco também impõe saldo não negativo. | Uma carteira muito disputada é serializada; conflitos transitórios são repetidos um número limitado de vezes. |
+| Transação PostgreSQL para operação, saldo, ledger e outbox | Ou todos esses registros são confirmados, ou nenhum é. A API só produz o resultado depois do commit. | A chamada ao SQS pelo publisher da outbox acontece enquanto uma transação e locks estão abertos; indisponibilidade/lentidão do broker pode prolongá-los. |
+| Idempotência persistida por chave e hash do conteúdo de negócio | Uma repetição com chave e conteúdo iguais retorna o resultado existente sem repetir o movimento; reutilizar a chave com conteúdo diferente gera conflito. | A garantia depende da persistência PostgreSQL, não de cache nem somente da deduplicação FIFO do SQS. |
+| Identidade externa única por `(provider_id, external_transaction_id)` | Impede que o mesmo provedor reutilize a identidade de uma operação. É uma proteção distinta da chave de idempotência. | O integrador precisa manter IDs estáveis e únicos por provedor. |
+| Saldo materializado mais ledger imutável | Saldo rápido para leitura; lançamentos de crédito/débito explicam sua evolução. Uma reconciliação compara o saldo ao líquido do ledger. | A reconciliação detecta e informa divergências, não as corrige automaticamente. `LOSS` não muda saldo e, portanto, não cria lançamento. |
+| Inbox e Outbox em PostgreSQL com SQS at-least-once | Inbox registra mensagens de entrada; outbox guarda eventos na mesma transação financeira para que um crash não perca o evento confirmado. | Publicação duplicada ainda é possível se o processo cair após o SQS aceitar a mensagem e antes de marcar a outbox como publicada. Consumidores devem deduplicar por `eventId`. |
+| Retry de referência com backoff | Permite receber `REFUND`, `ROLLBACK` ou `WIN` referenciado antes da operação original, sem rejeitá-lo de imediato. | Há limite de dez tentativas para referências; depois disso, a transação é rejeitada com `REFERENCE_NOT_FOUND`. |
+| MikroORM com SQL parametrizado nos trechos críticos | Mantém configuração/conexões e transações integradas ao NestJS, enquanto SQL torna explícitos `FOR UPDATE`, `SKIP LOCKED` e `ON CONFLICT`. | Exige cuidado manual com mapping, queries e serialização dos tipos do banco. |
+| Autenticação fora do escopo | A seção 2 do desafio permite um guard no-op desde que a decisão, o ponto de extensão e o desenho futuro sejam documentados. | O guard atual permite todas as requisições. O serviço não está protegido para produção. |
 
-O `AppModule` registra controllers e providers no container de injeção do NestJS. `main.ts` cria a aplicação, instala o filtro global de exceções e inicia o servidor.
+## Modelo de domínio
 
-Esta é uma aplicação DDD pragmática, não uma implementação purista de Clean Architecture: `WagerProcessorService` coordena SQL e transações diretamente com MikroORM, e não há uma camada formal de repositórios/interfaces de persistência. A separação importante aqui é manter as regras centrais em objetos de domínio (`Wallet`, `Money`, `WagerTransaction` e `WalletLedgerEntry`) em vez de espalhá-las pelos controllers ou pelo SQL.
+### Dinheiro e carteira
 
-DDD e MVC não são alternativas excludentes. Os controllers ainda cumprem um papel parecido com MVC: recebem requisições e devolvem respostas. A diferença é que as regras não são definidas pela estrutura das telas/rotas; elas são organizadas em torno do vocabulário e das regras do negócio.
+`Money` é um value object imutável de valor e moeda. A aritmética usa `Decimal`; operações entre moedas incompatíveis falham. O PostgreSQL armazena valores em `numeric(20,2)`. Contratos HTTP usam `{ "amount": "25.00", "currency": "BRL" }`, nunca número JSON.
 
-## 3. Modelo de domínio
+`Wallet` encapsula saldo e versão. `open` cria versão 1 e, quando o saldo inicial é positivo, cria também a transação interna `OPENING` e o lançamento `CREDIT`. `debit` e `credit` validam moeda e valor, criam o lançamento antes de atualizar o saldo e incrementam a versão quando o saldo muda. A unicidade de carteira por jogador/moeda e o saldo não negativo também são protegidos por constraints no banco.
 
-### Wallet e saldo
+### Operação e ledger
 
-`Wallet` representa a carteira de um jogador em uma moeda. Ela protege operações de crédito e débito, impede moedas incompatíveis e não permite saldo negativo. Cada mudança de saldo incrementa `version`.
-
-### Money
-
-`Money` é um value object: valor e moeda são tratados juntos e não há setters para alterar o objeto. A entrada monetária é uma string decimal com no máximo duas casas; as operações usam `Decimal`, nunca `number` de JavaScript. Isso evita erros de ponto flutuante, como os comuns ao representar centavos com `0.1 + 0.2`.
-
-O PostgreSQL usa `numeric(20,2)` e o domínio serializa o valor como string com duas casas. A moeda também é validada e comparações/aritmética entre moedas diferentes falham.
-
-### WagerTransaction
-
-`WagerTransaction` representa a operação enviada pelo provedor e controla seu ciclo de vida:
+`WagerTransaction` guarda a identidade interna/externa, provedor, valor, estado e eventual referência. Estados:
 
 ```text
 PENDING -> PROCESSED | REJECTED | FAILED | PENDING_REFERENCE
 PENDING_REFERENCE -> PROCESSED | REJECTED | FAILED | PENDING_REFERENCE
-PROCESSED, REJECTED e FAILED são estados terminais.
+PROCESSED, REJECTED e FAILED são terminais.
 ```
 
-Os tipos suportados são `BET`, `WIN`, `LOSS`, `REFUND` e `ROLLBACK`. `OPENING` é interno e registra um saldo inicial positivo. `LOSS` é registrado como operação, mas não movimenta o saldo. `REFUND` e `ROLLBACK` precisam apontar para uma operação anterior; uma referência ainda não recebida deixa a operação em `PENDING_REFERENCE`.
+Tipos externos: `BET`, `WIN`, `LOSS`, `REFUND` e `ROLLBACK`. `OPENING` é interno. `BET` debita; `WIN` credita; `LOSS` registra resultado sem novo movimento; `REFUND` credita uma aposta elegível; `ROLLBACK` inverte a direção da transação referenciada. Reversões exigem referência processada compatível e não podem ser aplicadas mais de uma vez segundo as constraints/regras da aplicação.
 
-### Ledger
+`WalletLedgerEntry` é imutável e verifica a relação entre saldo anterior, direção, valor e saldo posterior. A migration também impede atualização/exclusão e duplicação de lançamentos para uma operação/carteira.
 
-`WalletLedgerEntry` é o lançamento imutável que registra um crédito ou débito, o valor, o saldo anterior e o posterior. Uma `LOSS` não cria lançamento porque não altera saldo. Já a carteira mantém o saldo materializado para consulta rápida; o ledger dá o histórico verificável para auditoria e reconciliação.
+## Fluxo HTTP e idempotência
 
-## 4. Fluxo de uma operação HTTP
+1. `WageringController` recebe o JSON e exige `Idempotency-Key`.
+2. O serviço valida campos e valor, normaliza `Money` e calcula SHA-256 sobre os campos de negócio serializados de forma determinística; a chave e metadados de transporte não entram no hash.
+3. Na transação PostgreSQL, tenta registrar a operação. Se a chave já existe, compara o hash: igual é replay; diferente é conflito HTTP `409`.
+4. Bloqueia a linha da carteira com `SELECT ... FOR UPDATE`, reidrata o agregado e aplica as regras de saldo/moeda/referência.
+5. Persiste estado, saldo, ledger e eventos de outbox na mesma transação. Uma rejeição de regra é persistida como `REJECTED` com `failureCode` e sem movimento.
+6. Após o commit, devolve o resultado. O `balance_snapshot` é o saldo associado à operação, não necessariamente o saldo atual depois de operações posteriores.
 
-1. `WageringController` recebe o JSON e exige o header `Idempotency-Key`.
-2. `WagerProcessorService` valida os campos, normaliza `Money` e calcula um hash SHA-256 do conteúdo de negócio em formato determinístico.
-3. Em uma transação PostgreSQL, insere a operação como `PENDING`. Se a chave de idempotência já existir, compara o hash: conteúdo igual é repetição segura; conteúdo diferente retorna conflito (`409`).
-4. O serviço bloqueia a linha da carteira com `SELECT ... FOR UPDATE`, reconstruindo o objeto `Wallet`.
-5. Valida jogador, moeda, referência, tipo e regras de saldo. Uma aposta válida debita; uma operação de prêmio válida credita. Uma falha de regra persiste a operação como `REJECTED` com seu código de falha.
-6. Na mesma transação, grava o novo saldo, o lançamento do ledger, o estado/snapshot da operação e os eventos correspondentes na outbox.
-7. Só depois do commit a resposta HTTP é retornada. A controller usa `200` para resultado normal, `202` para referência pendente, `422` para rejeição de regra, `409` para conflito e `400` para entrada inválida.
+Na rota de submissão, os estados devem ser interpretados junto do status HTTP: `PROCESSED` é resultado aplicado; `REJECTED` informa `failureCode`; `PENDING`/`PENDING_REFERENCE` indica trabalho ainda não concluído. A implementação usa `200` para resultado normal/replay, `202` para pendência, `422` para rejeição de negócio, `409` para conflito, `400` para entrada inválida e `503` para conflito transitório de lock não resolvido.
 
-O uso de `balance_snapshot` significa que uma repetição pode receber o resultado/saldo associado àquela operação, sem confundir a resposta com o saldo atual após outras apostas.
+## Concorrência e integridade
 
-## 5. Consistência, concorrência e idempotência
+O PostgreSQL é a autoridade final. `SELECT ... FOR UPDATE` serializa alterações à mesma carteira. Carteiras diferentes podem avançar em paralelo. Em conflito de lock/deadlock, o serviço tenta novamente até duas vezes; se não resolver, devolve `503`.
 
-### Transação e bloqueio
+A migration complementa as regras da aplicação com constraints e índices para unicidade de carteira por jogador/moeda, saldo não negativo, tipos/estados válidos, chave de idempotência, identidade externa, referência obrigatória e reversão processada única. O ledger tem verificação aritmética, unicidade e trigger que bloqueia `UPDATE`/`DELETE`. A intenção é defesa em profundidade: um novo caminho de escrita também encontra as invariantes no banco.
 
-Alterar o saldo, criar o ledger, atualizar a transação e adicionar eventos à outbox são operações atômicas no PostgreSQL. Se uma etapa falhar, o banco desfaz a transação inteira.
+## SQS, Inbox e Outbox
 
-O bloqueio é feito por carteira, não globalmente. Duas apostas na mesma carteira são serializadas; carteiras diferentes podem ser processadas em paralelo. Em conflitos transitórios de lock/deadlock, o caso de uso tenta novamente até duas vezes; se ainda falhar, responde `503`.
+`WorkersService` recebe mensagens de `wager-transactions.fifo` e encaminha o payload a `submitWager`, o mesmo caso de uso da API. O registro de inbox usa `(consumer_name, message_id)` e é gravado junto à operação. O worker dá ack depois que o caso de uso termina; erros não confirmados ficam sujeitos à redelivery e à política de redrive para `wager-transactions-dlq.fifo` após cinco entregas.
 
-### Idempotência HTTP e identidade externa
+Eventos `WagerTransactionProcessed`, `WagerTransactionRejected`, `WagerTransactionPendingReference` e `WalletBalanceChanged` são gravados na outbox com a alteração financeira. O publisher usa `FOR UPDATE SKIP LOCKED`, publica em `wager-events.fifo` e marca o evento como publicado. Em falha agenda retry exponencial limitado a 300 segundos. Uma queda entre envio e marcação pode publicar duplicado; a garantia é at-least-once, não exactly-once.
 
-Há duas proteções relacionadas, mas distintas:
+**Trade-off a acompanhar:** o publisher mantém uma transação e locks enquanto faz a chamada de rede ao SQS. Isso é simples e permite que `SKIP LOCKED` distribua eventos entre publishers, mas pode segurar conexões/locks durante lentidão do broker. Uma evolução possível é reservar eventos por lease/claim em uma transação curta, publicar fora dela e marcar o resultado depois. Essa mudança exige novo tratamento de lease expirado e duplicatas; deve ser feita e testada, não presumida como melhoria sem risco.
 
-- `idempotency_key` identifica a intenção/requisição. A mesma chave e o mesmo payload de negócio podem ser repetidos sem reaplicar o movimento. A mesma chave com payload diferente resulta em conflito.
-- `(provider_id, external_transaction_id)` identifica a operação do lado do provedor e não pode ser reutilizado, por constraint única no banco.
+## Migrations, configuração e observabilidade
 
-O hash inclui os campos de negócio e o dinheiro normalizado; não inclui a própria chave ou metadados de transporte.
+`Migration20261030000000` cria tabelas, índices, constraints e trigger. `AUTO_MIGRATE=true` aplica migrations no Compose local. Em produção, execute `bun run migration:up` como etapa de release e defina `AUTO_MIGRATE=false`.
 
-### Integridade no banco
+O Compose sobe PostgreSQL 16, LocalStack SQS e API. `localstack/init-sqs.sh` provisiona filas FIFO e DLQ. Para AWS, use IAM roles/SSO ou Secrets Manager; não armazene credenciais no repositório.
 
-As regras não dependem apenas do código. A migration também cria constraints e índices para impedir carteira duplicada por jogador/moeda, saldo negativo, tipos/estados inválidos, lançamento duplicado por carteira/operação, aritmética inconsistente no ledger, referência obrigatória em reversões e reversão processada duplicada. Um trigger impede `UPDATE` e `DELETE` no ledger.
+`GET /health/live` verifica o processo; `/health/ready` verifica PostgreSQL e SQS; `/metrics` expõe métricas Prometheus, incluindo estados, replays, retries, conflitos de lock, divergências de reconciliação, lag da outbox e latência p95. Logs JSON de operações carregam `correlationId` (UUID interno da transação), `transactionId`, `walletId`, `providerId` e, quando disponível, `messageId`. Logs gerais de infraestrutura podem ter contexto menor.
 
-Essa duplicação intencional de garantias é uma defesa em profundidade: o domínio produz mudanças válidas, e o banco impede que bugs, concorrência ou outro caminho de escrita violem invariantes persistentes.
+## Testes, cobertura e limitações
 
-## 6. SQS: entrada, inbox e outbox
+Com PostgreSQL e LocalStack locais, os testes de integração cobrem constraints reais, redelivery SQS, 50 submissões duplicadas, duas apostas concorrentes na mesma carteira, carteiras distintas e referência que chega fora de ordem. Os três objetos `WagerProcessorService` do teste de concorrência usam conexões ORM separadas no mesmo processo; isso testa concorrência real no banco, mas não equivale a três processos do sistema operacional.
 
-### Inbox e consumidor
+Na execução de validação mais recente, `bun run test:integration` passou com 10 testes e `bun test` passou com 75 testes de domínio; sem as variáveis de ambiente de integração, os testes de integração são ignorados. Também passaram `bun run build` e `bun run lint`.
 
-`WorkersService` consulta a fila `wager-transactions.fifo`. Cada mensagem válida é encaminhada a `submitWager`, o mesmo caso de uso chamado pela API. A tabela `inbox_messages`, com chave `(consumer_name, message_id)`, registra mensagens já vistas na mesma transação da operação.
+Ainda não há testes explícitos de crash/restart entre commit e ack, redrive efetivo à DLQ, dois publishers independentes disputando a mesma outbox ou três processos separados. A rubrica pede esses cenários. Também vale ampliar casos de negócio específicos de `REFUND`/`ROLLBACK` e alinhar o tipo/nome das métricas Prometheus ao significado efetivo. A ausência desses testes não deve ser apresentada como garantia comprovada.
 
-O worker apaga/acknowledges a mensagem SQS somente depois de `submitWager` concluir o commit. Em caso de erro, deixa a mensagem sem ack; o SQS tenta entregá-la novamente e a política de redrive pode encaminhá-la à DLQ depois de cinco entregas. A inbox evita que uma redelivery processe a mesma mensagem novamente.
+## Referência a Spring Boot
 
-### Outbox e publicação
+As equivalências são conceituais: `@Module`/providers e injeção NestJS lembram configuração e beans Spring; controllers lembram `@RestController`; `WagerProcessorService` lembra um serviço de aplicação; o filtro de exceção lembra `@ControllerAdvice`; migrations lembram Flyway/Liquibase; e o `EntityManager.transactional()` do MikroORM oferece atomicidade semelhante a `@Transactional`. Nenhuma dessas equivalências implica que os frameworks tenham o mesmo ciclo de vida ou API.
 
-Eventos como `WagerTransactionProcessed`, `WagerTransactionRejected`, `WagerTransactionPendingReference` e `WalletBalanceChanged` são gravados em `outbox_messages` na mesma transação financeira. Isso evita o problema de confirmar o débito no banco e perder o evento porque o processo caiu antes de publicar na fila.
-
-Um worker busca eventos vencidos com `FOR UPDATE SKIP LOCKED`, publica-os na `wager-events.fifo` e registra o envio. Se houver erro, agenda uma nova tentativa com backoff exponencial limitado a 300 segundos. Uma queda depois do envio à SQS e antes do registro do sucesso pode causar publicação duplicada. Portanto, a garantia é **at-least-once**, e consumidores downstream devem deduplicar usando `eventId`.
-
-A fila FIFO ajuda com ordenação por carteira (`MessageGroupId`) e deduplicação de envio, mas não substitui as garantias transacionais/idempotentes do banco.
-
-## 7. Referências que chegam fora de ordem
-
-Uma reversão ou prêmio referenciado pode chegar antes da operação original. Em vez de falhar definitivamente, o sistema persiste `PENDING_REFERENCE`, registra a próxima tentativa e cria um evento. O worker verifica operações vencidas, bloqueia a transação com `SKIP LOCKED` e tenta processá-la de novo.
-
-O intervalo cresce exponencialmente, limitado a 300 segundos. Depois de dez tentativas sem encontrar a referência, a operação é rejeitada com `REFERENCE_NOT_FOUND`. Quando há referência, o domínio/aplicação verificam que ela foi processada e corresponde ao provedor, jogador, carteira, moeda e rodada esperados. `REFUND` e `ROLLBACK` também precisam respeitar o tipo e o valor da operação original.
-
-## 8. Persistência e migration
-
-`Migration20261030000000` cria tabelas, constraints, índices e trigger. `entity-schemas.ts` declara os metadados/tipos das tabelas para MikroORM, mas o serviço usa SQL parametrizado nas operações críticas para deixar claros os locks, `SKIP LOCKED`, constraints e transações. As queries usam parâmetros em vez de interpolar valores recebidos.
-
-`AUTO_MIGRATE=true` aplica migrations ao iniciar no Compose local. Em produção, a recomendação é executá-las como uma etapa de release (`bun run migration:up`) e configurar `AUTO_MIGRATE=false`, evitando que várias réplicas concorram para migrar durante o startup.
-
-## 9. Execução local e observabilidade
-
-`docker compose up --build` sobe PostgreSQL 16, LocalStack (SQS) e a aplicação. O script `localstack/init-sqs.sh` provisiona filas locais; o volume `pgdata` mantém o banco ao reiniciar containers. `WORKERS_ENABLED` controla os workers.
-
-`GET /health/live` verifica se o processo está vivo; `GET /health/ready` verifica dependências necessárias; `GET /metrics` expõe métricas em formato Prometheus, incluindo estados das transações, replays idempotentes, retries, conflitos de lock, divergências de reconciliação, lag da outbox e latência p95 persistida.
-
-Os logs de operações processadas, rejeitadas e pendentes são JSON e incluem `correlationId` (o UUID interno da transação), `messageId`, `transactionId`, `walletId` e `providerId`. Logs de falhas de infraestrutura podem ter contexto menor; não se deve assumir que todo log contém todos esses campos.
-
-`POST /wallets/:walletId/reconciliation` compara o saldo armazenado ao total líquido dos lançamentos. Ele informa e registra divergência; não corrige o saldo silenciosamente.
-
-## 10. Segurança e escopo
-
-`ProviderAuthGuard` é intencionalmente no-op neste desafio. Antes de expor a API, deve ser substituído por autenticação OIDC/JWT e deve validar que a identidade autenticada pode agir pelo `providerId` enviado. Health checks e métricas permanecem públicos no código atual.
-
-A configuração LocalStack usa credenciais fictícias de desenvolvimento. Para AWS, use IAM roles/SSO ou um gerenciador de segredos; não coloque credenciais no repositório. A integração AWS real também exige provisionamento das filas, URLs/ARNs, permissões e rede.
-
-Fora do escopo atual estão autenticação de produção, dashboard operacional, publicação multi-região e testes de caos com encerramento do processo em pontos específicos. A suíte também não demonstra ainda múltiplos processos do sistema operacional, concorrência de publishers Outbox, redrive efetivo à DLQ nem recuperação após reinício. Os testes de integração PostgreSQL exercitam invariantes reais, inclusive entregas repetidas, concorrência entre instâncias/conexões, referências fora de ordem e isolamento entre carteiras. Eles precisam de `DATABASE_URL`; sem ela, são ignorados.
-
-## 11. Comparação rápida com Spring
-
-| Este projeto | Equivalente aproximado em Spring |
-|---|---|
-| `@Module`, providers e injeção NestJS | `@Configuration`, componentes e container Spring |
-| Controller NestJS | `@RestController` |
-| `WagerProcessorService` | `@Service` de aplicação/orquestração |
-| Classes em `domain` | Modelo de domínio Java; `Money` se parece com um value object |
-| `EntitySchema` e migration MikroORM | Mapeamento de persistência e Flyway/Liquibase |
-| `EntityManager.transactional()` | `@Transactional` |
-| `SqsService` e `WorkersService` | Cliente SQS e listener/worker |
-| `ApiExceptionFilter` | `@ControllerAdvice` / exception handler |
-
-As equivalências são conceituais, não uma correspondência exata de frameworks. Em especial, a transação controla atomicidade no banco; ela não torna a publicação no SQS parte de uma transação distribuída. Inbox/outbox resolvem essa fronteira de maneira resiliente.
+Uma transação de banco não é uma transação distribuída com SQS. Inbox/Outbox tratam essa fronteira com persistência local e entrega at-least-once.
